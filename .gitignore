@@ -1,0 +1,9 @@
+.venv/
+**pycache**/
+*.pyc
+.env
+.streamlit/secrets.toml
+.vscode/
+.idea/
+*.db
+*.sqlite
