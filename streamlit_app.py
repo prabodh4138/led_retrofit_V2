@@ -3,6 +3,7 @@ from modules.dashboard import show_dashboard
 from modules.entry import show_entry_form
 from modules.reports import show_reports
 from modules.target_master import show_target_master
+from modules.pole_transactions import show_pole_transactions
 
 from utils.auth import (
     initialize_session,
@@ -169,7 +170,9 @@ with st.sidebar:
                 "Progress Report",
                 "Audit Log",
                 "User Management",
-                "Target Master"
+                "Target Master",
+                "Pole Management",
+                "Pole Transactions"
             ]
         )
 
@@ -238,3 +241,7 @@ elif menu == "User Management":
 elif menu == "Target Master":
 
     show_target_master()
+elif menu == "Pole Transactions":
+
+    from modules.pole_transactions import show_pole_transactions
+    show_pole_transactions()
