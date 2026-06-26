@@ -1,292 +1,493 @@
-import streamlit as st
+"""
+=========================================================
+Pole Transactions
+Version : V1.0
+
+Search Screen
+Pole Bucket
+Transaction Grid
+=========================================================
+"""
+
 import pandas as pd
+import streamlit as st
 
-from utils.db import supabase
-
-
-# =====================================================
-# RETROFIT MAPPING
-# =====================================================
-
-RETROFIT_MAP = {
-    350: 210,
-    300: 180,
-    250: 180,
-    180: 110,
-    80: 50
-}
+from utils.pole_engine import (
+    build_transaction,
+    refresh_transaction,
+    search_poles,
+    validate_transaction,
+)
+from utils.pole_save import save_transaction
 
 
-# =====================================================
-# LOAD ORDERED POLES
-# =====================================================
+CONDITION_OPTIONS = [
+    "Good",
+    "Damaged",
+    "Missing",
+    "Broken Arm",
+    "Glass Broken",
+    "Bracket Damaged",
+    "Other",
+]
 
-def load_ordered_poles():
+MAKE_OPTIONS = [
+    "Bajaj",
+    "Philips",
+    "Havells",
+    "Crompton",
+    "Wipro",
+    "Others",
+]
 
-    response = (
-        supabase
-        .table("vw_pole_search_ordered")
-        .select("*")
-        .execute()
-    )
+FIELD_EDIT_COLUMNS = [
+    "Dismantle A",
+    "Dismantle B",
+    "Condition",
+    "Make",
+    "Remarks",
+]
 
-    return pd.DataFrame(response.data)
+READ_ONLY_TRANSACTION_COLUMNS = [
+    "Pole No",
+    "Chainage",
+    "Pole Type",
+    "System A",
+    "System B",
+    "Install A",
+    "Install B",
+    "Mismatch",
+]
 
-
-# =====================================================
-# BUILD TRANSACTION GRID
-# =====================================================
-
-def build_transaction_grid(selected_df):
-
-    rows = []
-
-    for _, row in selected_df.iterrows():
-
-        dismantle_a = row["design_arm1_fixture"]
-        dismantle_b = row["design_arm2_fixture"]
-
-        install_a = RETROFIT_MAP.get(
-            dismantle_a,
-            None
-        )
-
-        install_b = RETROFIT_MAP.get(
-            dismantle_b,
-            None
-        )
-
-        rows.append(
-            {
-                "Edit": False,
-                "Pole No": row["pole_no"],
-                "Chainage": row["chainage"],
-                "Pole Type": row["pole_type"],
-                "Dismantle A": dismantle_a,
-                "Dismantle B": dismantle_b,
-                "Install A": install_a,
-                "Install B": install_b,
-                "Condition": "Good",
-                "Make": "Bajaj",
-                "Remarks": ""
-            }
-        )
-
-    return pd.DataFrame(rows)
+PROJECT_OPTIONS = [
+    "SRTPL",
+    "DTPL",
+    "TEL",
+]
 
 
 # =====================================================
-# MAIN PAGE
+# SESSION
+# =====================================================
+
+def _initialize_pole_session() -> None:
+    if "bucket_df" not in st.session_state:
+        st.session_state["bucket_df"] = pd.DataFrame()
+
+    if "transaction_df" not in st.session_state:
+        st.session_state["transaction_df"] = pd.DataFrame()
+
+    if "summary" not in st.session_state:
+        st.session_state["summary"] = {}
+
+    if "validation" not in st.session_state:
+        st.session_state["validation"] = {}
+
+    if "search_result" not in st.session_state:
+        st.session_state["search_result"] = {}
+
+    if "bucket_editor_version" not in st.session_state:
+        st.session_state["bucket_editor_version"] = 0
+
+    if "transaction_editor_version" not in st.session_state:
+        st.session_state["transaction_editor_version"] = 0
+
+    if "active_pole_project" not in st.session_state:
+        st.session_state["active_pole_project"] = ""
+
+
+def _state(key: str, default):
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+    return st.session_state[key]
+
+
+def _bump_counter(key: str) -> None:
+    current_value = _state(key, 0)
+    st.session_state[key] = int(current_value or 0) + 1
+
+
+def _empty_pole_state(clear_bucket: bool = True) -> None:
+    _initialize_pole_session()
+
+    if clear_bucket:
+        st.session_state["bucket_df"] = pd.DataFrame()
+        st.session_state["search_result"] = {}
+        _bump_counter("bucket_editor_version")
+
+    st.session_state["transaction_df"] = pd.DataFrame()
+    st.session_state["summary"] = {}
+    st.session_state["validation"] = {}
+    _bump_counter("transaction_editor_version")
+
+
+# =====================================================
+# HELPERS
+# =====================================================
+
+def _is_empty_df(value) -> bool:
+    return not isinstance(value, pd.DataFrame) or value.empty
+
+
+def _show_summary(summary: dict) -> None:
+    if not summary:
+        return
+
+    st.divider()
+    st.subheader("Transaction Summary")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+
+    with col1:
+        st.metric("Selected Poles", summary.get("selected_poles", 0))
+        st.metric("SA Poles", summary.get("sa_poles", 0))
+
+    with col2:
+        st.metric("DA Poles", summary.get("da_poles", 0))
+        st.metric("Mismatch", summary.get("mismatch", 0))
+
+    with col3:
+        st.metric("Dismantled", summary.get("dismantled_fixtures", 0))
+        st.metric("Installed", summary.get("installed_fixtures", 0))
+
+    with col4:
+        st.metric("Good", summary.get("good", 0))
+        st.metric("Damaged", summary.get("damaged", 0))
+
+    with col5:
+        st.metric("Bajaj", summary.get("bajaj", 0))
+        st.metric("Others", summary.get("others_make", 0))
+
+
+def _apply_edit_flags(
+    edited_df: pd.DataFrame,
+    previous_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if edited_df.empty or previous_df.empty:
+        return edited_df
+
+    if "Edit" not in edited_df.columns:
+        return edited_df
+
+    if "Pole No" not in edited_df.columns:
+        return edited_df
+
+    previous_by_pole = previous_df.set_index("Pole No")
+    updated_df = edited_df.copy()
+
+    for index, row in updated_df.iterrows():
+        if bool(row.get("Edit", False)):
+            continue
+
+        pole_no = row.get("Pole No")
+
+        if pole_no not in previous_by_pole.index:
+            continue
+
+        for column in FIELD_EDIT_COLUMNS:
+            if column in updated_df.columns and column in previous_by_pole.columns:
+                updated_df.at[index, column] = previous_by_pole.at[pole_no, column]
+
+    return updated_df
+
+
+def _bucket_editor_key() -> str:
+    version = _state("bucket_editor_version", 0)
+    return f"bucket_editor_{version}"
+
+
+def _transaction_editor_key() -> str:
+    version = _state("transaction_editor_version", 0)
+    return f"transaction_editor_{version}"
+
+
+# =====================================================
+# MAIN
 # =====================================================
 
 def show_pole_transactions():
+    _initialize_pole_session()
 
     st.subheader("Pole Transactions")
+    st.divider()
 
-    st.markdown("---")
+    user_project = str(st.session_state.get("project", "") or "").strip()
+    username = st.session_state.get("username", "")
 
-    # =================================================
-    # SEARCH SECTION
-    # =================================================
+    if not user_project:
+        st.warning("Project not found in session.")
+        return
 
-    col1, col2, col3 = st.columns(3)
+    project = user_project.upper()
 
-    with col1:
-
-        search_pole = st.text_input(
-            "Search Pole Number",
-            placeholder="P005"
+    if project == "ALL":
+        project = st.selectbox(
+            "Project",
+            PROJECT_OPTIONS,
+            key="pole_transaction_project",
         )
+    else:
+        st.caption(f"Project : {project}")
 
-    with col2:
+    if st.session_state["active_pole_project"] != project:
+        st.session_state["active_pole_project"] = project
+        _empty_pole_state(clear_bucket=True)
 
-        search_mode = st.radio(
+    # ---------------------------------------------
+    # SEARCH
+    # ---------------------------------------------
+
+    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
+
+    with c1:
+        pole_no = st.text_input(
+            "Pole Number",
+            placeholder="Example : P003",
+        ).strip().upper()
+
+    with c2:
+        mode = st.selectbox(
             "Search Mode",
             [
                 "Pole Range",
-                "Same Chainage"
-            ]
+                "Same Chainage",
+            ],
         )
 
-    with col3:
-
-        pole_range = st.number_input(
-            "Range",
-            min_value=1,
-            max_value=20,
-            value=10
+    with c3:
+        before = st.number_input(
+            "- Pole",
+            min_value=0,
+            max_value=50,
+            value=10,
+            step=1,
         )
 
-    fetch_btn = st.button(
-        "Fetch Poles",
-        use_container_width=True
-    )
+    with c4:
+        after = st.number_input(
+            "+ Pole",
+            min_value=0,
+            max_value=50,
+            value=10,
+            step=1,
+        )
 
-    # =================================================
-    # FETCH POLES
-    # =================================================
-
-    if fetch_btn:
-
-        try:
-
-            df = load_ordered_poles()
-
-            if df.empty:
-
-                st.warning(
-                    "No poles found."
-                )
-
-                st.stop()
-
-            if not search_pole:
-
-                st.warning(
-                    "Enter Pole Number."
-                )
-
-                st.stop()
-
-            search_pole = (
-                search_pole
-                .strip()
-                .upper()
+    if st.button("Search", use_container_width=True):
+        if not pole_no:
+            _empty_pole_state(clear_bucket=True)
+            st.error("Pole Number is required.")
+        else:
+            result = search_poles(
+                project=project,
+                pole_no=pole_no,
+                mode=mode,
+                before=int(before),
+                after=int(after),
             )
 
-            selected_row = df[
-                df["pole_no"] == search_pole
-            ]
+            if result.get("success", False):
+                bucket_df = result.get("bucket_df", pd.DataFrame())
 
-            if selected_row.empty:
-
-                st.error(
-                    f"{search_pole} not found."
-                )
-
-                st.stop()
-
-            # -----------------------------------------
-            # POLE RANGE MODE
-            # -----------------------------------------
-
-            if search_mode == "Pole Range":
-
-                pole_seq = int(
-                    selected_row.iloc[0][
-                        "pole_sequence"
-                    ]
-                )
-
-                filtered_df = df[
-                    (
-                        df["pole_sequence"]
-                        >= pole_seq - pole_range
-                    )
-                    &
-                    (
-                        df["pole_sequence"]
-                        <= pole_seq + pole_range
-                    )
-                ]
-
-            # -----------------------------------------
-            # SAME CHAINAGE MODE
-            # -----------------------------------------
-
+                st.session_state["search_result"] = result
+                st.session_state["bucket_df"] = bucket_df
+                st.session_state["transaction_df"] = pd.DataFrame()
+                st.session_state["summary"] = {}
+                st.session_state["validation"] = {}
+                st.session_state["bucket_editor_version"] += 1
+                st.session_state["transaction_editor_version"] += 1
             else:
+                _empty_pole_state(clear_bucket=True)
+                st.error(result.get("message", "Search Failed."))
 
-                chainage = (
-                    selected_row.iloc[0][
-                        "chainage"
-                    ]
-                )
-
-                filtered_df = df[
-                    df["chainage"]
-                    == chainage
-                ]
-
-            filtered_df = (
-                filtered_df
-                .sort_values(
-                    by="pole_sequence"
-                )
-                .reset_index(drop=True)
-            )
-
-            st.session_state[
-                "pole_bucket"
-            ] = filtered_df
-
-        except Exception as e:
-
-            st.error(str(e))
-
-            st.stop()
-
-    # =================================================
+    # ==================================================
     # POLE BUCKET
-    # =================================================
+    # ==================================================
 
-    if "pole_bucket" in st.session_state:
-
-        bucket_df = (
-            st.session_state[
-                "pole_bucket"
-            ]
-            .copy()
-        )
-
-        bucket_df["Select"] = False
-
+    if not _is_empty_df(st.session_state["bucket_df"]):
         st.markdown("### Pole Bucket")
 
-        edited_bucket = st.data_editor(
-            bucket_df[
-                [
-                    "Select",
-                    "pole_no",
-                    "chainage",
-                    "pole_type",
-                    "design_arm1_fixture",
-                    "design_arm2_fixture"
-                ]
-            ],
+        bucket_df = st.data_editor(
+            st.session_state["bucket_df"],
             hide_index=True,
             use_container_width=True,
-            key="pole_bucket_grid"
+            key=_bucket_editor_key(),
+            column_config={
+                "Select": st.column_config.CheckboxColumn("Select"),
+            },
         )
 
-        selected_df = edited_bucket[
-            edited_bucket["Select"] == True
-        ]
+        st.session_state["bucket_df"] = bucket_df
 
-        # =============================================
-        # TRANSACTION GRID
-        # =============================================
+        st.divider()
 
-        if not selected_df.empty:
+        if st.button(
+            "Build Transaction Grid",
+            type="primary",
+            use_container_width=True,
+        ):
+            build_result = build_transaction(bucket_df)
 
-            st.markdown("---")
-
-            st.markdown(
-                "### Transaction Grid"
-            )
-
-            transaction_df = (
-                build_transaction_grid(
-                    selected_df
+            if build_result.get("success", False):
+                transaction_df = build_result.get(
+                    "transaction_df",
+                    pd.DataFrame(),
                 )
+
+                st.session_state["transaction_df"] = transaction_df
+                st.session_state["summary"] = build_result.get("summary", {})
+                st.session_state["validation"] = {}
+                st.session_state["transaction_editor_version"] += 1
+            else:
+                _empty_pole_state(clear_bucket=False)
+                st.error(
+                    build_result.get(
+                        "message",
+                        "Unable to build transaction.",
+                    )
+                )
+
+    # ==================================================
+    # TRANSACTION GRID
+    # ==================================================
+
+    if _is_empty_df(st.session_state["transaction_df"]):
+        return
+
+    st.markdown("### Transaction Grid")
+
+    previous_transaction_df = st.session_state["transaction_df"].copy()
+
+    edited_transaction_df = st.data_editor(
+        previous_transaction_df,
+        hide_index=True,
+        use_container_width=True,
+        key=_transaction_editor_key(),
+        disabled=READ_ONLY_TRANSACTION_COLUMNS,
+        column_config={
+            "Edit": st.column_config.CheckboxColumn("Edit"),
+            "Dismantle A": st.column_config.NumberColumn("Dismantle A"),
+            "Dismantle B": st.column_config.NumberColumn("Dismantle B"),
+            "Condition": st.column_config.SelectboxColumn(
+                "Condition",
+                options=CONDITION_OPTIONS,
+            ),
+            "Make": st.column_config.SelectboxColumn(
+                "Make",
+                options=MAKE_OPTIONS,
+            ),
+            "Remarks": st.column_config.TextColumn("Remarks"),
+        },
+    )
+
+    edited_transaction_df = _apply_edit_flags(
+        edited_transaction_df,
+        previous_transaction_df,
+    )
+
+    refresh_result = refresh_transaction(edited_transaction_df)
+
+    if refresh_result.get("success", False):
+        refreshed_df = refresh_result.get(
+            "transaction_df",
+            edited_transaction_df,
+        )
+
+        st.session_state["transaction_df"] = refreshed_df
+        st.session_state["summary"] = refresh_result.get("summary", {})
+        st.session_state["validation"] = refresh_result.get("validation", {})
+    else:
+        st.session_state["transaction_df"] = edited_transaction_df
+        st.warning(
+            refresh_result.get(
+                "message",
+                "Unable to refresh transaction.",
+            )
+        )
+
+    engine_result = validate_transaction(
+        st.session_state["transaction_df"]
+    )
+
+    if engine_result.get("success", False):
+        validated_df = engine_result.get(
+            "transaction_df",
+            st.session_state["transaction_df"],
+        )
+
+        st.session_state["transaction_df"] = validated_df
+        st.session_state["summary"] = engine_result.get("summary", {})
+        st.session_state["validation"] = engine_result.get("validation", {})
+    else:
+        st.session_state["summary"] = engine_result.get(
+            "summary",
+            st.session_state["summary"],
+        )
+        st.session_state["validation"] = engine_result.get("validation", {})
+
+    _show_summary(st.session_state["summary"])
+
+    # ==================================================
+    # VALIDATION RESULT
+    # ==================================================
+
+    st.divider()
+
+    if engine_result.get("success", False):
+        st.success(
+            engine_result.get(
+                "message",
+                "Validation Successful.",
+            )
+        )
+    else:
+        st.error(
+            engine_result.get(
+                "message",
+                "Validation Failed.",
+            )
+        )
+
+    # ==================================================
+    # SAVE
+    # ==================================================
+
+    st.divider()
+
+    save_disabled = not engine_result.get("success", False)
+
+    if st.button(
+        "Save Transaction",
+        type="primary",
+        disabled=save_disabled,
+        use_container_width=True,
+    ):
+        with st.spinner("Saving..."):
+            save_result = save_transaction(
+                transaction_df=st.session_state["transaction_df"],
+                username=username,
+                project=project,
             )
 
-            st.data_editor(
-                transaction_df,
-                hide_index=True,
-                use_container_width=True,
-                key="transaction_grid"
-            )
-
+        if save_result.get("success", False):
             st.success(
-                f"{len(selected_df)} pole(s) selected."
+                f"""
+Transaction Saved Successfully
+
+Transaction No :
+{save_result.get("transaction_no", "")}
+"""
             )
+            st.balloons()
+            _empty_pole_state(clear_bucket=True)
+        else:
+            st.error(save_result.get("message", "Save failed."))
+
+
+# ==========================================================
+# MODULE COMPLETE
+# ==========================================================
+
+__all__ = [
+    "show_pole_transactions",
+]
